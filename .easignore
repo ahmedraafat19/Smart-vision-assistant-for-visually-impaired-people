@@ -1,0 +1,15 @@
+node_modules/
+.edge-tts-venv/
+.expo/
+dist/
+web-build/
+android/
+ios/
+.git/
+.DS_Store
+npm-debug.*
+yarn-debug.*
+yarn-error.*
+*.log
+.env
+.env.*
