@@ -35,6 +35,12 @@ import {
   NativeModules,
 } from 'react-native';
 
+const {
+  genericCloudError,
+  redactSensitiveText,
+  safeBackendUrl,
+} = require('./security/security_utils');
+
 const API_KEY_STORAGE_KEY = 'visionclaw_gemini_api_key';
 const LANGUAGE_STORAGE_KEY = 'baseera_language';
 const ARABIC_VOICE_STORAGE_KEY = 'baseera_arabic_voice_gender';
@@ -51,6 +57,7 @@ const CURRENCY_IMAGE_SIZE = 224;
 const CURRENCY_CLASSES = ['1', '10', '100', '20', '200', '5', '50', 'none'];
 const CURRENCY_CONFIDENCE_THRESHOLD = 0.94;
 const CURRENCY_MARGIN_THRESHOLD = 0.55;
+const CURRENCY_MIN_AGREEING_CROPS = 2;
 const NO_BANKNOTE_LABELS = new Set(['none', 'no_banknote', 'background', 'empty']);
 const MONEY_ONLY_COMMAND_PATTERN =
   /\b(how much|what amount|amount|value|denomination|currency value|money value|which banknote|what banknote|what bill|how many pounds)\b|كام\s+(?:جنيه|فلوس|الفلوس|المبلغ)|بكام|قد\s*ايه|قيم(?:ة|ه)|فئ(?:ة|ه)|أنهي\s+ورقة|ايه\s+الورقة|الورقة\s+بكام|الفلوس\s+دي\s+بكام|المبلغ\s+كام/iu;
@@ -64,6 +71,7 @@ const GEMINI_BACKEND_URL =
   Constants.expoConfig?.extra?.geminiBackendUrl ||
   Constants.manifest?.extra?.geminiBackendUrl ||
   '';
+const SAFE_GEMINI_BACKEND_URL = safeBackendUrl(GEMINI_BACKEND_URL);
 function cleanApiKey(value) {
   return String(value || '')
     .replace(/^OpenRouter API key\s*[:=]\s*/i, '')
@@ -841,9 +849,22 @@ export default function App() {
     const nativeModelReady = isCurrencyModelReady && currencySessionRef.current;
 
     try {
-      const prediction = nativeModelReady
-        ? await classifyCurrencyImage(imageUri)
-        : await classifyCurrencyWithBackend(imageBase64);
+      let prediction = nativeModelReady ? await classifyCurrencyImage(imageUri) : null;
+
+      if ((!prediction?.accepted || !prediction.amount) && SAFE_GEMINI_BACKEND_URL) {
+        const backendPrediction = await classifyCurrencyWithBackend(imageBase64);
+        if (backendPrediction?.accepted && backendPrediction.amount) {
+          prediction = backendPrediction;
+        }
+      }
+
+      if (!prediction?.accepted || !prediction.amount) {
+        const visionPrediction = await classifyCurrencyWithVisionFallback(imageBase64, speechLanguage);
+        if (visionPrediction?.accepted && visionPrediction.amount) {
+          prediction = visionPrediction;
+        }
+      }
+
       if (!prediction?.accepted || !prediction.amount) {
         return languageText.currencyUnclear;
       }
@@ -853,10 +874,46 @@ export default function App() {
     }
   }
 
-  async function classifyCurrencyWithBackend(imageBase64) {
-    if (!imageBase64 || !GEMINI_BACKEND_URL) return null;
+  async function classifyCurrencyWithVisionFallback(imageBase64, speechLanguage) {
+    if (!imageBase64 || !activeApiKey) return null;
 
-    const response = await fetch(`${GEMINI_BACKEND_URL.replace(/\/$/, '')}/currency`, {
+    const prompt =
+      speechLanguage === 'ar'
+        ? [
+            'دي مراجعة أخيرة ضيقة لفئة ورقة بنكنوت مصرية فقط.',
+            'لو شايف ورقة بنكنوت مصرية بوضوح، رد برقم واحد فقط من: 1, 5, 10, 20, 50, 100, 200.',
+            'لو مش متأكد أو الصورة مش واضحة أو مش ورقة جنيه مصري، رد: unclear.',
+            'ممنوع تشرح وممنوع تخمن.',
+          ].join('\n')
+        : [
+            'This is a narrow final verifier for an Egyptian banknote denomination only.',
+            'If one Egyptian banknote is clearly visible, answer with exactly one number from: 1, 5, 10, 20, 50, 100, 200.',
+            'If unclear, not Egyptian pounds, or not a banknote, answer: unclear.',
+            'Do not explain and do not guess.',
+          ].join('\n');
+
+    try {
+      const response = await callGemini(prompt, imageBase64, null, { currencyOnly: true });
+      const amount = parseCurrencyAmountFromText(response);
+      return amount
+        ? {
+            accepted: true,
+            amount,
+            label: String(amount),
+            confidence: 1,
+            margin: 1,
+            source: 'vision_currency_verifier',
+          }
+        : null;
+    } catch {
+      return null;
+    }
+  }
+
+  async function classifyCurrencyWithBackend(imageBase64) {
+    if (!imageBase64 || !SAFE_GEMINI_BACKEND_URL) return null;
+
+    const response = await fetch(`${SAFE_GEMINI_BACKEND_URL}/currency`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -1083,8 +1140,8 @@ export default function App() {
             },
           ],
           generationConfig: {
-            temperature: 0.2,
-            maxOutputTokens: audioBase64 ? 160 : 220,
+            temperature: options.currencyOnly ? 0 : 0.2,
+            maxOutputTokens: options.currencyOnly ? 24 : audioBase64 ? 160 : 220,
             ...(audioBase64 ? { responseMimeType: 'application/json' } : {}),
           },
         }),
@@ -1161,8 +1218,8 @@ export default function App() {
             content: userContent,
           },
         ],
-        temperature: 0.2,
-        max_tokens: audioBase64 ? 160 : 220,
+        temperature: options.currencyOnly ? 0 : 0.2,
+        max_tokens: options.currencyOnly ? 24 : audioBase64 ? 160 : 220,
         ...(audioBase64 ? { response_format: { type: 'json_object' } } : {}),
         provider: {
           data_collection: 'deny',
@@ -1224,7 +1281,7 @@ export default function App() {
       ].join('\n');
     }
 
-    return message;
+    return genericCloudError('Gemini');
   }
 
   function formatOpenRouterError(message) {
@@ -1253,7 +1310,7 @@ export default function App() {
       ].join('\n');
     }
 
-    return message;
+    return genericCloudError('OpenRouter');
   }
 
   function speak(value, speechLanguage = language, voiceGender = arabicVoiceGender) {
@@ -1262,7 +1319,7 @@ export default function App() {
 
     if (canUseGeminiTts()) {
       generateSpeech(value, resolvedVoiceOption).catch((error) => {
-        console.warn('Gemini TTS failed', error?.message || error);
+        console.warn('Gemini TTS failed', redactSensitiveText(error?.message || error));
         speakWithDeviceVoice(value, isArabic, voiceGender);
       });
       return;
@@ -1291,7 +1348,7 @@ export default function App() {
     const cleanText = cleanSpokenAnswer(stripJsonLikeText(value), speechLanguage);
     if (!cleanText) return;
 
-    const response = await fetch(`${GEMINI_BACKEND_URL.replace(/\/$/, '')}/tts`, {
+    const response = await fetch(`${SAFE_GEMINI_BACKEND_URL}/tts`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -1303,8 +1360,8 @@ export default function App() {
     });
 
     if (!response.ok) {
-      const errorText = await response.text().catch(() => '');
-      throw new Error(errorText || 'Gemini TTS failed');
+      await response.text().catch(() => '');
+      throw new Error(genericCloudError('Gemini TTS'));
     }
 
     const bytes = new Uint8Array(await response.arrayBuffer());
@@ -1679,6 +1736,35 @@ function amountFromCurrencyLabel(label) {
   return match ? Number(match[0]) : null;
 }
 
+function parseCurrencyAmountFromText(value) {
+  const normalized = String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+    .replace(/\s+/g, ' ');
+
+  if (!normalized || normalized.includes('unclear') || normalized.includes('مش')) {
+    return null;
+  }
+
+  const numeric = normalized.match(/\b(?:1|5|10|20|50|100|200)\b/u);
+  if (numeric) {
+    return Number(numeric[0]);
+  }
+
+  const words = [
+    [200, /\b(?:two hundred)\b|ميتين|مئتين/u],
+    [100, /\b(?:one hundred|hundred)\b|مية|مئة/u],
+    [50, /\b(?:fifty)\b|خمسين/u],
+    [20, /\b(?:twenty)\b|عشرين/u],
+    [10, /\b(?:ten)\b|عشرة|عشر/u],
+    [5, /\b(?:five)\b|خمسة|خمس/u],
+    [1, /\b(?:one)\b|واحد/u],
+  ];
+  const matchedWord = words.find(([, pattern]) => pattern.test(normalized));
+  return matchedWord ? matchedWord[0] : null;
+}
+
 function amountToEgyptianArabic(amount) {
   const amounts = {
     1: 'جنيه واحد',
@@ -1719,7 +1805,9 @@ function getCurrencyCropRegions(width, height) {
     crop('bottom_center', width * 0.12, height * 0.48, width * 0.88, height),
     crop('bottom_half', 0, height * 0.5, width, height),
     crop('bottom_40', 0, height * 0.6, width, height),
-    crop('note_band', width * 0.03, height * 0.62, width * 0.97, height * 0.94),
+    crop('note_band', width * 0.03, height * 0.45, width * 0.97, height * 0.8),
+    crop('table_area', 0, height * 0.35, width * 0.75, height * 0.7),
+    crop('note_closeup', width * 0.3, height * 0.42, width * 0.78, height * 0.68),
     crop('lower_left', 0, height * 0.42, width * 0.68, height),
     crop('lower_right', width * 0.32, height * 0.42, width, height),
     crop('middle_lower', width * 0.05, height * 0.38, width * 0.95, height * 0.86),
@@ -1753,11 +1841,17 @@ function pickCurrencyPrediction(predictions) {
         (b.averageConfidence - a.averageConfidence)
     );
 
-  return rankedGroups[0]?.best || null;
+  const bestGroup = rankedGroups[0];
+  if (!bestGroup || bestGroup.count < CURRENCY_MIN_AGREEING_CROPS) return null;
+
+  return {
+    ...bestGroup.best,
+    consensusCount: bestGroup.count,
+  };
 }
 
 function canUseGeminiTts() {
-  return Boolean(GEMINI_BACKEND_URL);
+  return Boolean(SAFE_GEMINI_BACKEND_URL);
 }
 
 function stripJsonLikeText(value) {

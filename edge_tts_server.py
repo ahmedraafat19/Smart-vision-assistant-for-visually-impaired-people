@@ -1,27 +1,92 @@
 #!/usr/bin/env python3
 import base64
+import hashlib
 import json
 import os
+import re
 import struct
 import subprocess
 import tempfile
 import urllib.error
 import urllib.request
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-CURRENCY_ROOT = PROJECT_ROOT.parent / "currency model "
+MAX_JSON_BODY_BYTES = int(os.environ.get("MAX_JSON_BODY_BYTES", str(12 * 1024 * 1024)))
+MAX_IMAGE_BYTES = int(os.environ.get("MAX_IMAGE_BYTES", str(5 * 1024 * 1024)))
+ALLOWED_ORIGINS = [origin.strip() for origin in os.environ.get("CORS_ALLOWED_ORIGINS", "").split(",") if origin.strip()]
+
+SECRET_PATTERNS = [
+    re.compile(r"sk-or-v1-[A-Za-z0-9_-]+"),
+    re.compile(r"sk-[A-Za-z0-9_-]+"),
+    re.compile(r"AIza[ A-Za-z0-9_-]+"),
+    re.compile(r"Bearer\s+\S+", re.IGNORECASE),
+    re.compile(r"(OPENROUTER_API_KEY|OPENAI_API_KEY|GEMINI_API_KEY|BACKEND_CLIENT_TOKEN|API_KEY)\s*[:=]\s*[^\s,}]+", re.IGNORECASE),
+    re.compile(r"data:image/[^;]+;base64,[A-Za-z0-9+/=]+"),
+    re.compile(r'"imageBase64"\s*:\s*"[A-Za-z0-9+/=]+"'),
+    re.compile(r"[A-Za-z0-9+/=]{160,}"),
+]
+
+
+def redact_sensitive_text(value):
+    text = str(value or "")
+    for pattern in SECRET_PATTERNS:
+        text = pattern.sub("[redacted]", text)
+    return text
+
+
+def first_existing_path(paths):
+    for path in paths:
+        if path and path.exists():
+            return path
+    return None
+
+
+def currency_root_candidates():
+    env_root = os.environ.get("CURRENCY_ROOT", "").strip()
+    downloads_root = Path.home() / "Downloads"
+    return [
+        Path(env_root).expanduser() if env_root else None,
+        PROJECT_ROOT.parent / "currency model ",
+        PROJECT_ROOT.parent / "testing" / "currency model ",
+        downloads_root / "testing" / "currency model ",
+        downloads_root / "currency model ",
+    ]
+
+
+def currency_model_candidates():
+    env_model = (
+        os.environ.get("CURRENCY_MODEL_PATH", "").strip()
+        or os.environ.get("CURRENCY_MODEL", "").strip()
+    )
+    relative_candidates = [
+        Path("runs/classify/currency-denomination-none-partial-n224/weights/best.pt"),
+        Path("runs/classify/currency-denomination-none-n224/weights/best.pt"),
+        Path("runs/classify/currency-denomination-n224-baseline/weights/best.pt"),
+    ]
+    candidates = [Path(env_model).expanduser() if env_model else None]
+    for root in currency_root_candidates():
+        if root:
+            candidates.extend(root / relative_path for relative_path in relative_candidates)
+    return candidates
+
+
+def root_for_currency_model(model_path):
+    if not model_path:
+        return first_existing_path([path for path in currency_root_candidates() if path]) or PROJECT_ROOT
+
+    parts = model_path.parts
+    if "runs" in parts:
+        return Path(*parts[: parts.index("runs")])
+    return model_path.parent
+
+
+CURRENCY_MODEL = first_existing_path(currency_model_candidates())
+CURRENCY_ROOT = root_for_currency_model(CURRENCY_MODEL)
 CURRENCY_PYTHON = CURRENCY_ROOT / ".venv" / "bin" / "python"
-CURRENCY_MODEL = (
-    CURRENCY_ROOT
-    / "runs"
-    / "classify"
-    / "currency-denomination-none-partial-n224"
-    / "weights"
-    / "best.pt"
-)
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 GEMINI_TTS_MODEL = os.environ.get("GEMINI_TTS_MODEL", "gemini-2.5-flash-preview-tts").strip()
@@ -41,6 +106,10 @@ VOICE_OPTIONS = {
 
 
 class GeminiBackendHandler(BaseHTTPRequestHandler):
+    def handle_one_request(self):
+        self.request_id = str(uuid.uuid4())
+        super().handle_one_request()
+
     def do_OPTIONS(self):
         self.send_response(204)
         self.send_cors_headers()
@@ -48,14 +117,15 @@ class GeminiBackendHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path != "/health":
-            self.send_error(404)
+            self.send_json_error(404, "Not found", "not_found")
             return
 
         self.send_json(
             {
                 "ok": True,
                 "geminiTtsConfigured": bool(GEMINI_API_KEY),
-                "currencyModelExists": CURRENCY_MODEL.exists(),
+                "currencyModelExists": bool(CURRENCY_MODEL and CURRENCY_MODEL.exists()),
+                "currencyModelPath": str(CURRENCY_MODEL) if CURRENCY_MODEL else "",
                 "voiceOptions": list(VOICE_OPTIONS.keys()),
             }
         )
@@ -69,10 +139,12 @@ class GeminiBackendHandler(BaseHTTPRequestHandler):
             self.handle_currency()
             return
 
-        self.send_error(404)
+        self.send_json_error(404, "Not found", "not_found")
 
     def read_json(self):
         length = int(self.headers.get("Content-Length", "0"))
+        if length > MAX_JSON_BODY_BYTES:
+            raise ValueError("Request body is too large")
         return json.loads(self.rfile.read(length).decode("utf-8"))
 
     def handle_tts(self):
@@ -81,13 +153,13 @@ class GeminiBackendHandler(BaseHTTPRequestHandler):
             text = str(payload.get("text", "")).strip()
             voice_option = str(payload.get("voiceOption", "female_ar")).strip()
             if not text:
-                self.send_error(400, "text is required")
+                self.send_json_error(400, "text is required", "validation_error")
                 return
             if voice_option not in VOICE_OPTIONS:
-                self.send_error(400, "voiceOption must be male_en, female_en, male_ar, or female_ar")
+                self.send_json_error(400, "voiceOption must be male_en, female_en, male_ar, or female_ar", "validation_error")
                 return
             if not GEMINI_API_KEY:
-                self.send_error(500, "GEMINI_API_KEY is not configured on the backend")
+                self.send_json_error(500, "TTS provider is not configured", "tts_not_configured")
                 return
 
             audio = generate_speech(text, voice_option)
@@ -98,20 +170,24 @@ class GeminiBackendHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(audio)
         except Exception as exc:
-            self.send_error(500, str(exc))
+            print(f"tts_error requestId={self.request_id} error={redact_sensitive_text(exc)}")
+            self.send_json_error(500, "TTS failed. Please try again.", "tts_failed")
 
     def handle_currency(self):
         try:
             payload = self.read_json()
             image_base64 = str(payload.get("imageBase64", "")).strip()
             if not image_base64:
-                self.send_error(400, "imageBase64 is required")
+                self.send_json_error(400, "imageBase64 is required", "validation_error")
                 return
 
             if "," in image_base64 and "base64" in image_base64.split(",", 1)[0]:
                 image_base64 = image_base64.split(",", 1)[1]
 
             image_bytes = base64.b64decode(image_base64)
+            if len(image_bytes) > MAX_IMAGE_BYTES:
+                self.send_json_error(413, "Image payload is too large", "image_too_large")
+                return
             with tempfile.NamedTemporaryFile(suffix=".jpg") as image_file:
                 image_file.write(image_bytes)
                 image_file.flush()
@@ -119,9 +195,11 @@ class GeminiBackendHandler(BaseHTTPRequestHandler):
 
             self.send_json(result)
         except Exception as exc:
-            self.send_error(500, str(exc))
+            print(f"currency_error requestId={self.request_id} error={redact_sensitive_text(exc)}")
+            self.send_json_error(500, "Currency recognition failed. Please try again.", "currency_failed")
 
     def send_json(self, payload, status=200):
+        payload = {"requestId": getattr(self, "request_id", ""), **payload}
         body = json.dumps(payload).encode("utf-8")
         self.send_response(status)
         self.send_cors_headers()
@@ -130,13 +208,24 @@ class GeminiBackendHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def send_json_error(self, status, message, code):
+        self.send_json({"ok": False, "error": code, "message": message}, status=status)
+
     def send_cors_headers(self):
-        self.send_header("Access-Control-Allow-Origin", "*")
+        origin = self.headers.get("Origin", "")
+        if origin and origin in ALLOWED_ORIGINS:
+            self.send_header("Access-Control-Allow-Origin", origin)
+        elif not ALLOWED_ORIGINS:
+            self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("X-Request-Id", getattr(self, "request_id", ""))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
 
     def log_message(self, fmt, *args):
-        print("%s - %s" % (self.address_string(), fmt % args))
+        client_key = hashlib.sha256(self.address_string().encode("utf-8")).hexdigest()[:12]
+        print("requestId=%s client=%s %s" % (getattr(self, "request_id", ""), client_key, redact_sensitive_text(fmt % args)))
 
 
 def generate_speech(text, voice_option):
@@ -170,8 +259,8 @@ def generate_speech(text, voice_option):
         with urllib.request.urlopen(request, timeout=45) as response:
             data = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
-        error_body = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"Gemini TTS failed: {error_body}") from exc
+        exc.read()
+        raise RuntimeError("Gemini TTS failed") from exc
 
     inline_data = (
         data.get("candidates", [{}])[0]
@@ -239,8 +328,13 @@ def pcm_to_wav(pcm_bytes, sample_rate=24000, channels=1, bits_per_sample=16):
 
 
 def classify_currency(image_path):
-    if not CURRENCY_MODEL.exists():
-        return {"accepted": False, "error": f"Missing currency model: {CURRENCY_MODEL}"}
+    if not CURRENCY_MODEL or not CURRENCY_MODEL.exists():
+        searched = [str(path) for path in currency_model_candidates() if path]
+        return {
+            "accepted": False,
+            "error": "Missing currency model",
+            "searched": searched,
+        }
 
     python_bin = CURRENCY_PYTHON if CURRENCY_PYTHON.exists() else "python3"
     script = r"""
@@ -262,7 +356,9 @@ crop_boxes = [
     ("bottom_center", (int(w * 0.12), int(h * 0.48), int(w * 0.88), h)),
     ("bottom_half", (0, int(h * 0.50), w, h)),
     ("bottom_40", (0, int(h * 0.60), w, h)),
-    ("note_band", (int(w * 0.03), int(h * 0.62), int(w * 0.97), int(h * 0.94))),
+    ("note_band", (int(w * 0.03), int(h * 0.45), int(w * 0.97), int(h * 0.80))),
+    ("table_area", (0, int(h * 0.35), int(w * 0.75), int(h * 0.70))),
+    ("note_closeup", (int(w * 0.30), int(h * 0.42), int(w * 0.78), int(h * 0.68))),
     ("lower_left", (0, int(h * 0.42), int(w * 0.68), h)),
     ("lower_right", (int(w * 0.32), int(h * 0.42), w, h)),
     ("middle_lower", (int(w * 0.05), int(h * 0.38), int(w * 0.95), int(h * 0.86))),
@@ -303,51 +399,30 @@ if accepted:
     groups = {}
     for item in accepted:
         groups.setdefault(item["amount"], []).append(item)
-    ranked_groups = sorted(
-        groups.items(),
-        key=lambda entry: (
-            len(entry[1]),
-            max(item["margin"] for item in entry[1]),
-            sum(item["confidence"] for item in entry[1]) / len(entry[1]),
-        ),
-        reverse=True,
-    )
-    best = dict(sorted(ranked_groups[0][1], key=lambda item: (item["margin"], item["confidence"]), reverse=True)[0])
-    best["candidates"] = [dict(item) for item in results[:5]]
-    print(json.dumps(best))
-    raise SystemExit
-
-relaxed = [
-    item for item in results
-    if item["amount"] is not None and item["confidence"] >= 0.40 and item["margin"] >= 0.20
-]
-if relaxed:
-    groups = {}
-    for item in relaxed:
-        groups.setdefault(item["amount"], []).append(item)
-    ranked_groups = sorted(
-        groups.items(),
-        key=lambda entry: (
-            len(entry[1]),
-            max(item["margin"] for item in entry[1]),
-            sum(item["confidence"] for item in entry[1]) / len(entry[1]),
-        ),
-        reverse=True,
-    )
-    if len(ranked_groups[0][1]) < 2:
-        best = dict(sorted(results, key=lambda item: (item["confidence"], item["margin"]), reverse=True)[0])
-        print(json.dumps({"accepted": False, **best, "candidates": [dict(item) for item in results[:5]]}))
-        raise SystemExit
-    best = dict(sorted(ranked_groups[0][1], key=lambda item: (item["margin"], item["confidence"]), reverse=True)[0])
-    best["accepted"] = True
-    best["relaxed"] = True
-    best["candidates"] = [dict(item) for item in results[:5]]
-    print(json.dumps(best))
-    raise SystemExit
+    strong_amounts = list(groups.keys())
+    if len(strong_amounts) == 1:
+        best_group = groups[strong_amounts[0]]
+        if len(best_group) >= 2:
+            best = dict(sorted(best_group, key=lambda item: (item["margin"], item["confidence"]), reverse=True)[0])
+            best["consensusCount"] = len(best_group)
+            best["candidates"] = [dict(item) for item in sorted(results, key=lambda item: (item["confidence"], item["margin"]), reverse=True)[:8]]
+            print(json.dumps(best))
+            raise SystemExit
+    conflict = {
+        "amounts": sorted(str(amount) for amount in strong_amounts),
+    }
+else:
+    conflict = {}
 
 best = dict(sorted(results, key=lambda item: (item["confidence"], item["margin"]), reverse=True)[0]) if results else {}
-print(json.dumps({"accepted": False, **best, "candidates": [dict(item) for item in results[:5]]}))
-"""
+print(json.dumps({
+    **best,
+    "accepted": False,
+    "reason": "not_enough_currency_crop_agreement",
+    "conflict": conflict,
+    "candidates": [dict(item) for item in sorted(results, key=lambda item: (item["confidence"], item["margin"]), reverse=True)[:8]],
+}))
+    """
     process = subprocess.run(
         [str(python_bin), "-c", script, str(CURRENCY_MODEL), image_path],
         check=False,
@@ -357,7 +432,7 @@ print(json.dumps({"accepted": False, **best, "candidates": [dict(item) for item 
         timeout=30,
     )
     if process.returncode != 0:
-        return {"accepted": False, "error": process.stderr.strip() or process.stdout.strip()}
+        return {"accepted": False, "error": "currency_model_failed"}
 
     return json.loads(process.stdout.strip().splitlines()[-1])
 
@@ -366,6 +441,7 @@ def main():
     server = ThreadingHTTPServer(("0.0.0.0", 5055), GeminiBackendHandler)
     print("Gemini TTS and currency server running on http://0.0.0.0:5055")
     print("TTS configured:", bool(GEMINI_API_KEY))
+    print("Currency model:", CURRENCY_MODEL or "not found")
     server.serve_forever()
 
 

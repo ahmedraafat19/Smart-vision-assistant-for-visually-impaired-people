@@ -1,0 +1,46 @@
+name: Security Checks
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - master
+
+jobs:
+  security-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Security utility tests
+        run: npm run test:security
+
+      - name: Expo config check
+        run: npx expo config --type public >/tmp/expo-config.json
+
+      - name: npm audit report
+        run: |
+          npm audit --audit-level=high || {
+            echo "npm audit found vulnerabilities. Review the report before release."
+            echo "The workflow does not fail here because Expo/React Native fixes may require planned SDK upgrades."
+          }
+
+      - name: Python backend syntax
+        run: python3 -m py_compile edge_tts_server.py
+
+      - name: Secret scanning reminder
+        run: |
+          echo "Before production release, run secret scanning such as:"
+          echo "gitleaks detect --source . --redact"
+          echo "or enable GitHub secret scanning for the repository."
