@@ -57,7 +57,13 @@ const CURRENCY_IMAGE_SIZE = 224;
 const CURRENCY_CLASSES = ['1', '10', '100', '20', '200', '5', '50', 'none'];
 const CURRENCY_CONFIDENCE_THRESHOLD = 0.94;
 const CURRENCY_MARGIN_THRESHOLD = 0.55;
-const CURRENCY_MIN_AGREEING_CROPS = 2;
+const CURRENCY_MIN_AGREEING_CROPS = 1;
+const CURRENCY_CAPTURE_WIDTH = 1280;
+const CURRENCY_CAPTURE_COMPRESS = 0.85;
+const CURRENCY_BACKEND_TIMEOUT_MS = 9000;
+const CURRENCY_VISION_TIMEOUT_MS = 8000;
+const CURRENCY_INTENT_TIMEOUT_MS = 5000;
+const BACKEND_HEALTH_TIMEOUT_MS = 3000;
 const NO_BANKNOTE_LABELS = new Set(['none', 'no_banknote', 'background', 'empty']);
 const MONEY_ONLY_COMMAND_PATTERN =
   /\b(how much|what amount|amount|value|denomination|currency value|money value|which banknote|what banknote|what bill|how many pounds)\b|كام\s+(?:جنيه|فلوس|الفلوس|المبلغ)|بكام|قد\s*ايه|قيم(?:ة|ه)|فئ(?:ة|ه)|أنهي\s+ورقة|ايه\s+الورقة|الورقة\s+بكام|الفلوس\s+دي\s+بكام|المبلغ\s+كام/iu;
@@ -497,6 +503,10 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    checkCurrencyBackendHealth();
+  }, []);
+
+  useEffect(() => {
     if (BUILT_IN_API_KEY) {
       setApiKey(BUILT_IN_API_KEY);
       return;
@@ -679,6 +689,102 @@ export default function App() {
     });
   }
 
+  async function fetchWithTimeout(url, fetchOptions = {}, timeoutMs = 0) {
+    if (!timeoutMs) {
+      return fetch(url, fetchOptions);
+    }
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      return await fetch(url, {
+        ...fetchOptions,
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  }
+
+  function logCurrencyDebug(label, payload = {}) {
+    try {
+      console.log(`currency_debug:${label}`, JSON.stringify(sanitizeCurrencyDebug(payload)));
+    } catch {
+      console.log(`currency_debug:${label}`);
+    }
+  }
+
+  function sanitizeCurrencyDebug(value) {
+    if (Array.isArray(value)) {
+      return value.slice(0, 8).map(sanitizeCurrencyDebug);
+    }
+    if (!value || typeof value !== 'object') {
+      return typeof value === 'string' && value.length > 180
+        ? `${value.slice(0, 180)}...`
+        : value;
+    }
+    return Object.fromEntries(
+      Object.entries(value)
+        .filter(([key]) => !/base64|image|audio|key|token/i.test(key))
+        .map(([key, item]) => [key, sanitizeCurrencyDebug(item)])
+    );
+  }
+
+  async function checkCurrencyBackendHealth() {
+    if (!SAFE_GEMINI_BACKEND_URL) {
+      logCurrencyDebug('backend_health', {
+        ok: false,
+        reason: 'missing_backend_url',
+        GEMINI_BACKEND_URL: SAFE_GEMINI_BACKEND_URL,
+      });
+      return;
+    }
+
+    try {
+      const response = await fetchWithTimeout(
+        `${SAFE_GEMINI_BACKEND_URL}/health`,
+        { method: 'GET' },
+        BACKEND_HEALTH_TIMEOUT_MS
+      );
+      const health = await response.json().catch(() => ({}));
+      logCurrencyDebug('backend_health', {
+        ok: response.ok,
+        GEMINI_BACKEND_URL: SAFE_GEMINI_BACKEND_URL,
+        currencyModelExists: health.currencyModelExists,
+        currencyModelLoaded: health.currencyModelLoaded,
+        currencyModelLoadError: health.currencyModelLoadError,
+        requestId: health.requestId,
+      });
+    } catch (error) {
+      logCurrencyDebug('backend_health', {
+        ok: false,
+        GEMINI_BACKEND_URL: SAFE_GEMINI_BACKEND_URL,
+        reason: error?.name === 'AbortError' ? 'backend_health_timeout' : 'backend_health_failed',
+      });
+    }
+  }
+
+  async function prepareCurrencyImage(imageUri) {
+    if (!imageUri) return null;
+    return ImageManipulator.manipulateAsync(
+      imageUri,
+      [{ resize: { width: CURRENCY_CAPTURE_WIDTH } }],
+      {
+        compress: CURRENCY_CAPTURE_COMPRESS,
+        format: ImageManipulator.SaveFormat.JPEG,
+        base64: true,
+      }
+    );
+  }
+
+  async function captureCurrencyImage() {
+    const photo = await cameraRef.current.takePictureAsync({
+      quality: 0.9,
+      skipProcessing: false,
+    });
+    return prepareCurrencyImage(photo.uri);
+  }
+
   async function askVision(prompt, options = {}) {
     if (!cameraRef.current || (!isReady && !options.force)) return;
 
@@ -697,6 +803,14 @@ export default function App() {
         quality: 0.65,
         skipProcessing: false,
       });
+      const currencyImagePromise = options.smartVoice
+        ? prepareCurrencyImage(photo.uri).catch((error) => {
+            logCurrencyDebug('currency_image_prepare_failed', {
+              reason: error?.message || 'image_prepare_failed',
+            });
+            return null;
+          })
+        : null;
 
       const compressed = await ImageManipulator.manipulateAsync(
         photo.uri,
@@ -713,7 +827,12 @@ export default function App() {
       });
 
       if (options.smartVoice) {
-        await handleSmartVoiceResult(resultText, compressed);
+        const currencyImage = await currencyImagePromise;
+        await handleSmartVoiceResult(resultText, {
+          ...compressed,
+          currencyUri: currencyImage?.uri,
+          currencyBase64: currencyImage?.base64,
+        });
       } else {
         setAnswer(resultText);
         speak(resultText);
@@ -729,10 +848,14 @@ export default function App() {
   }
 
   async function handleSmartVoiceResult(rawText, currentImage) {
+    console.log('smart_voice_raw', redactSensitiveText(rawText));
     const parsed = parseSmartResponse(rawText);
+    console.log('smart_voice_parsed', JSON.stringify(parsed));
     const nextLanguage = parsed.language === 'en' || parsed.language === 'ar' ? parsed.language : language;
     const shouldChangeLanguage = nextLanguage !== language;
     const currentImageBase64 = currentImage?.base64;
+    const currencyImageBase64 = currentImage?.currencyBase64;
+    const currencyImageUri = currentImage?.currencyUri;
 
     if (shouldChangeLanguage) {
       await updateLanguage(nextLanguage);
@@ -740,12 +863,14 @@ export default function App() {
 
     let spokenAnswer = cleanSpokenAnswer(parsed.answer || rawText, nextLanguage);
     const currencyMode = getCurrencyMode(parsed, rawText, spokenAnswer);
+    console.log('smart_voice_currency_mode', JSON.stringify({ currencyMode }));
 
     if (currencyMode === 'money_only') {
       spokenAnswer = await identifyCurrencyForSpeech(
-        currentImage?.uri,
-        currentImageBase64,
-        nextLanguage
+        currencyImageUri,
+        currencyImageBase64,
+        nextLanguage,
+        { allowVisionFallback: true, fastPath: false }
       );
     } else {
       spokenAnswer = removeGuessedCurrencyValue(spokenAnswer, nextLanguage);
@@ -849,32 +974,70 @@ export default function App() {
     speak(text.facesCleared);
   }
 
-  async function identifyCurrencyForSpeech(imageUri, imageBase64, speechLanguage) {
+  async function identifyCurrencyForSpeech(imageUri, imageBase64, speechLanguage, options = {}) {
     const languageText = UI_TEXT[speechLanguage] || text;
     const nativeModelReady = isCurrencyModelReady && currencySessionRef.current;
+    const allowVisionFallback = options.allowVisionFallback !== false;
 
     try {
+      logCurrencyDebug('start', {
+        fastPath: Boolean(options.fastPath),
+        nativeModelReady: Boolean(nativeModelReady),
+        GEMINI_BACKEND_URL: SAFE_GEMINI_BACKEND_URL,
+        allowVisionFallback,
+      });
+
       let prediction = nativeModelReady ? await classifyCurrencyImage(imageUri) : null;
+      if (prediction) {
+        logCurrencyDebug('local_onnx_prediction', prediction);
+      } else {
+        logCurrencyDebug('local_onnx_prediction', {
+          accepted: false,
+          reason: nativeModelReady ? 'no_local_prediction' : 'native_model_not_ready',
+        });
+      }
 
       if ((!prediction?.accepted || !prediction.amount) && SAFE_GEMINI_BACKEND_URL) {
         const backendPrediction = await classifyCurrencyWithBackend(imageBase64);
         if (backendPrediction?.accepted && backendPrediction.amount) {
           prediction = backendPrediction;
+        } else if (backendPrediction) {
+          logCurrencyDebug('backend_rejected', backendPrediction);
         }
       }
 
-      if (!prediction?.accepted || !prediction.amount) {
+      if ((!prediction?.accepted || !prediction.amount) && allowVisionFallback) {
         const visionPrediction = await classifyCurrencyWithVisionFallback(imageBase64, speechLanguage);
         if (visionPrediction?.accepted && visionPrediction.amount) {
           prediction = visionPrediction;
+        } else if (visionPrediction) {
+          logCurrencyDebug('vision_fallback_rejected', visionPrediction);
         }
       }
 
       if (!prediction?.accepted || !prediction.amount) {
+        logCurrencyDebug('final', {
+          accepted: false,
+          source: prediction?.source || 'none',
+          reason: prediction?.reason || 'no_accepted_currency_prediction',
+        });
         return languageText.currencyUnclear;
       }
+      logCurrencyDebug('final', {
+        accepted: true,
+        source: prediction.source,
+        label: prediction.label,
+        amount: prediction.amount,
+        confidence: prediction.confidence,
+        margin: prediction.margin,
+        crop: prediction.crop,
+        consensusCount: prediction.consensusCount,
+      });
       return languageText.currencyDetected(prediction.amount);
-    } catch {
+    } catch (error) {
+      logCurrencyDebug('failed', {
+        reason: error?.name === 'AbortError' ? 'currency_timeout' : error?.message || 'currency_failed',
+      });
       return languageText.currencyUnclear;
     }
   }
@@ -898,7 +1061,10 @@ export default function App() {
           ].join('\n');
 
     try {
-      const response = await callGemini(prompt, imageBase64, null, { currencyOnly: true });
+      const response = await callGemini(prompt, imageBase64, null, {
+        currencyOnly: true,
+        timeoutMs: CURRENCY_VISION_TIMEOUT_MS,
+      });
       const amount = parseCurrencyAmountFromText(response);
       return amount
         ? {
@@ -909,32 +1075,74 @@ export default function App() {
             margin: 1,
             source: 'vision_currency_verifier',
           }
-        : null;
-    } catch {
-      return null;
+        : {
+            accepted: false,
+            source: 'vision_currency_verifier',
+            reason: 'vision_verifier_unclear',
+          };
+    } catch (error) {
+      return {
+        accepted: false,
+        source: 'vision_currency_verifier',
+        reason: error?.name === 'AbortError' ? 'vision_verifier_timeout' : 'vision_verifier_failed',
+      };
     }
   }
 
   async function classifyCurrencyWithBackend(imageBase64) {
     if (!imageBase64 || !SAFE_GEMINI_BACKEND_URL) return null;
 
-    const response = await fetch(`${SAFE_GEMINI_BACKEND_URL}/currency`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ imageBase64 }),
-    });
-
-    if (!response.ok) return null;
-    const result = await response.json();
-    return {
-      accepted: Boolean(result.accepted),
-      amount: amountFromCurrencyLabel(result.amount ?? result.label),
-      label: result.label,
-      confidence: Number(result.confidence) || 0,
-      margin: Number(result.margin) || 0,
-    };
+    try {
+      const response = await fetchWithTimeout(
+        `${SAFE_GEMINI_BACKEND_URL}/currency`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ imageBase64 }),
+        },
+        CURRENCY_BACKEND_TIMEOUT_MS
+      );
+      const result = await response.json().catch(() => ({}));
+      logCurrencyDebug('backend_response', {
+        ok: response.ok,
+        requestId: result.requestId,
+        accepted: result.accepted,
+        label: result.label,
+        amount: result.amount,
+        confidence: result.confidence,
+        margin: result.margin,
+        crop: result.crop,
+        reason: result.reason || result.error,
+        candidates: result.candidates,
+      });
+      if (!response.ok) {
+        return {
+          accepted: false,
+          source: 'backend_yolo',
+          reason: result.reason || result.error || 'backend_error',
+        };
+      }
+      return {
+        accepted: Boolean(result.accepted),
+        amount: amountFromCurrencyLabel(result.amount ?? result.label),
+        label: result.label,
+        confidence: Number(result.confidence) || 0,
+        margin: Number(result.margin) || 0,
+        crop: result.crop,
+        consensusCount: result.consensusCount,
+        source: result.source || 'backend_yolo',
+        reason: result.reason,
+        candidates: result.candidates,
+      };
+    } catch (error) {
+      return {
+        accepted: false,
+        source: 'backend_yolo',
+        reason: error?.name === 'AbortError' ? 'backend_currency_timeout' : 'backend_currency_failed',
+      };
+    }
   }
 
   async function classifyCurrencyImage(imageUri) {
@@ -972,7 +1180,8 @@ export default function App() {
       }
     }
 
-    return pickCurrencyPrediction(predictions);
+    const result = pickCurrencyPrediction(predictions);
+    return result ? { ...result, source: 'local_onnx' } : null;
   }
 
   async function classifyCurrencyBase64(imageBase64) {
@@ -1056,6 +1265,116 @@ export default function App() {
     audioRecorder.record({ forDuration: MAX_RECORDING_MS / 1000 });
   }
 
+  async function classifyVoiceCurrencyIntent(audioBase64) {
+    if (!audioBase64 || !isOpenRouterKey(activeApiKey)) return null;
+
+    const prompt = [
+      'Classify the attached voice command only.',
+      'Return JSON only: {"currencyRequested":true|false,"language":"ar"|"en"|"same"}',
+      'currencyRequested is true only if the user asks for money, banknote value, denomination, amount, or how much EGP is visible.',
+      'Do not infer currency intent from background noise or visible content.',
+    ].join('\n');
+
+    try {
+      const response = await fetchWithTimeout(
+        'https://openrouter.ai/api/v1/chat/completions',
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${activeApiKey}`,
+            'Content-Type': 'application/json',
+            'HTTP-Referer': 'https://baseera.local',
+            'X-Title': 'بصيرة',
+          },
+          body: JSON.stringify({
+            model: OPENROUTER_GEMINI_MODEL,
+            messages: [
+              {
+                role: 'user',
+                content: [
+                  {
+                    type: 'text',
+                    text: prompt,
+                  },
+                  {
+                    type: 'input_audio',
+                    input_audio: {
+                      data: audioBase64,
+                      format: 'm4a',
+                    },
+                  },
+                ],
+              },
+            ],
+            temperature: 0,
+            max_tokens: 40,
+            response_format: { type: 'json_object' },
+            provider: {
+              data_collection: 'deny',
+              zdr: true,
+            },
+          }),
+        },
+        CURRENCY_INTENT_TIMEOUT_MS
+      );
+      const json = await response.json().catch(() => ({}));
+      const content = json?.choices?.[0]?.message?.content;
+      const rawIntent = Array.isArray(content)
+        ? content.map((part) => part.text || '').join('\n').trim()
+        : String(content || '').trim();
+      const parsedIntent = parseCurrencyIntentResponse(rawIntent);
+      logCurrencyDebug('audio_intent', {
+        ok: response.ok,
+        raw: rawIntent,
+        parsed: parsedIntent,
+      });
+      return response.ok ? parsedIntent : null;
+    } catch (error) {
+      logCurrencyDebug('audio_intent', {
+        ok: false,
+        reason: error?.name === 'AbortError' ? 'audio_intent_timeout' : 'audio_intent_failed',
+      });
+      return null;
+    }
+  }
+
+  async function runFastCurrencyRecognition(speechLanguage = language) {
+    if (!cameraRef.current || !canUseCamera) return false;
+
+    if (!(await ensureCloudConsent())) {
+      setAnswer(text.cloudCancelled);
+      speak(text.cloudCancelled, speechLanguage);
+      return true;
+    }
+
+    setIsBusy(true);
+    setAnswer(UI_TEXT[speechLanguage]?.currencyModelLoading || text.currencyModelLoading);
+    Speech.stop();
+
+    try {
+      const currencyImage = await captureCurrencyImage();
+      const spokenAnswer = await identifyCurrencyForSpeech(
+        currencyImage?.uri,
+        currencyImage?.base64,
+        speechLanguage,
+        { allowVisionFallback: false, fastPath: true }
+      );
+      setAnswer(spokenAnswer);
+      speak(spokenAnswer, speechLanguage);
+      return true;
+    } catch (error) {
+      logCurrencyDebug('fast_path_failed', {
+        reason: error?.message || 'fast_currency_failed',
+      });
+      const unclear = UI_TEXT[speechLanguage]?.currencyUnclear || text.currencyUnclear;
+      setAnswer(unclear);
+      speak(unclear, speechLanguage);
+      return true;
+    } finally {
+      setIsBusy(false);
+    }
+  }
+
   async function stopVoiceCommand(reason = 'manual') {
     if (!audioRecorder.isRecording && !isRecording) return;
 
@@ -1076,6 +1395,16 @@ export default function App() {
 
       const audioFile = new File(audioUri);
       const audioBase64 = await audioFile.base64();
+      const currencyIntent = await classifyVoiceCurrencyIntent(audioBase64);
+
+      if (currencyIntent?.currencyRequested) {
+        const speechLanguage =
+          currencyIntent.language === 'ar' || currencyIntent.language === 'en'
+            ? currencyIntent.language
+            : language;
+        await runFastCurrencyRecognition(speechLanguage);
+        return;
+      }
 
       await askVision(
         buildSmartVoicePrompt(language, faceProfiles),
@@ -1107,7 +1436,7 @@ export default function App() {
 
     const referenceFaceParts = buildGeminiReferenceFaceParts(options.referenceFaces || []);
 
-    const response = await fetch(
+    const response = await fetchWithTimeout(
       `https://generativelanguage.googleapis.com/v1beta/models/${GOOGLE_GEMINI_MODEL}:generateContent`,
       {
         method: 'POST',
@@ -1150,7 +1479,8 @@ export default function App() {
             ...(audioBase64 ? { responseMimeType: 'application/json' } : {}),
           },
         }),
-      }
+      },
+      options.timeoutMs
     );
 
     const json = await response.json();
@@ -1194,16 +1524,20 @@ export default function App() {
             },
           ]
         : []),
-      {
-        type: 'image_url',
-        image_url: {
-          url: `data:image/jpeg;base64,${imageBase64}`,
-        },
-      },
+      ...(imageBase64
+        ? [
+            {
+              type: 'image_url',
+              image_url: {
+                url: `data:image/jpeg;base64,${imageBase64}`,
+              },
+            },
+          ]
+        : []),
       ...referenceFaceContent,
     ];
 
-    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+    const response = await fetchWithTimeout('https://openrouter.ai/api/v1/chat/completions', {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${cleanedKey}`,
@@ -1231,7 +1565,7 @@ export default function App() {
           zdr: true,
         },
       }),
-    });
+    }, options.timeoutMs);
 
     const json = await response.json();
 
@@ -1602,6 +1936,32 @@ function parseLooseSmartResponse(rawText, fallback) {
   };
 }
 
+function parseCurrencyIntentResponse(rawText) {
+  const text = String(rawText || '').trim();
+  const fallback = {
+    currencyRequested: MONEY_ONLY_COMMAND_PATTERN.test(text),
+    language: 'same',
+  };
+
+  try {
+    const jsonText =
+      text.startsWith('{') && text.endsWith('}')
+        ? text
+        : text.match(/\{[\s\S]*\}/)?.[0];
+    if (!jsonText) return fallback;
+    const parsed = JSON.parse(jsonText);
+    return {
+      currencyRequested:
+        parsed.currencyRequested === true ||
+        parsed.intent === 'currency' ||
+        (MONEY_ONLY_COMMAND_PATTERN.test(text) && parsed.currencyRequested !== false),
+      language: parsed.language === 'ar' || parsed.language === 'en' ? parsed.language : 'same',
+    };
+  } catch {
+    return fallback;
+  }
+}
+
 function cleanSpokenAnswer(value, speechLanguage = 'ar') {
   let text = String(value || '').trim();
   if (!text) return '';
@@ -1713,6 +2073,17 @@ function acceptedCurrencyPrediction(rawScores) {
     top.confidence >= CURRENCY_CONFIDENCE_THRESHOLD &&
     margin >= CURRENCY_MARGIN_THRESHOLD &&
     Boolean(amount);
+  const reason = accepted
+    ? 'accepted'
+    : NO_BANKNOTE_LABELS.has(String(top.label || '').toLowerCase())
+      ? 'top_label_is_none'
+      : !amount
+        ? 'top_label_is_not_amount'
+        : top.confidence < CURRENCY_CONFIDENCE_THRESHOLD
+          ? 'low_confidence'
+          : margin < CURRENCY_MARGIN_THRESHOLD
+            ? 'low_margin'
+            : 'rejected';
 
   return {
     accepted,
@@ -1721,6 +2092,8 @@ function acceptedCurrencyPrediction(rawScores) {
     confidence: top.confidence,
     margin,
     index: top.index,
+    reason,
+    candidates: ranked.slice(0, 5),
   };
 }
 
@@ -1824,8 +2197,34 @@ function getCurrencyCropRegions(width, height) {
 }
 
 function pickCurrencyPrediction(predictions) {
+  const candidates = [...predictions]
+    .sort((a, b) => (b.confidence - a.confidence) || (b.margin - a.margin))
+    .slice(0, 8)
+    .map((prediction) => ({
+      crop: prediction.crop,
+      label: prediction.label,
+      amount: prediction.amount,
+      confidence: prediction.confidence,
+      margin: prediction.margin,
+      accepted: prediction.accepted,
+      reason: prediction.reason,
+    }));
   const accepted = predictions.filter((prediction) => prediction.accepted && prediction.amount);
-  if (!accepted.length) return null;
+  if (!accepted.length) {
+    const bestRejected = candidates[0];
+    return bestRejected
+      ? {
+          ...bestRejected,
+          accepted: false,
+          reason: bestRejected.reason || 'no_strong_currency_crop',
+          candidates,
+        }
+      : {
+          accepted: false,
+          reason: 'no_currency_crops',
+          candidates: [],
+        };
+  }
 
   const grouped = accepted.reduce((groups, prediction) => {
     const key = String(prediction.amount);
@@ -1851,11 +2250,21 @@ function pickCurrencyPrediction(predictions) {
     );
 
   const bestGroup = rankedGroups[0];
-  if (!bestGroup || bestGroup.count < CURRENCY_MIN_AGREEING_CROPS) return null;
+  if (!bestGroup || bestGroup.count < CURRENCY_MIN_AGREEING_CROPS) {
+    return {
+      ...(bestGroup?.best || candidates[0] || {}),
+      accepted: false,
+      reason: 'not_enough_currency_crop_agreement',
+      candidates,
+    };
+  }
 
   return {
     ...bestGroup.best,
+    accepted: true,
     consensusCount: bestGroup.count,
+    candidates,
+    conflictAmounts: rankedGroups.length > 1 ? rankedGroups.slice(1).map((group) => group.amount) : [],
   };
 }
 
@@ -1871,6 +2280,15 @@ function stripJsonLikeText(value) {
 
 function getCurrencyMode(parsed, rawText, spokenAnswer) {
   if (parsed?.currencyRequested === true) {
+    return 'money_only';
+  }
+  if (parsed?.intent === 'currency') {
+    return 'money_only';
+  }
+  if (MONEY_ONLY_COMMAND_PATTERN.test(String(rawText || ''))) {
+    return 'money_only';
+  }
+  if (MONEY_ONLY_COMMAND_PATTERN.test(String(spokenAnswer || ''))) {
     return 'money_only';
   }
 

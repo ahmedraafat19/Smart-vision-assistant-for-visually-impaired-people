@@ -1,23 +1,36 @@
 #!/usr/bin/env python3
 import base64
 import hashlib
+import io
 import json
 import os
 import re
 import struct
-import subprocess
-import tempfile
+import threading
 import urllib.error
 import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+try:
+    from PIL import Image
+    from ultralytics import YOLO
+except Exception as exc:
+    Image = None
+    YOLO = None
+    CURRENCY_IMPORT_ERROR = str(exc)
+else:
+    CURRENCY_IMPORT_ERROR = ""
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 MAX_JSON_BODY_BYTES = int(os.environ.get("MAX_JSON_BODY_BYTES", str(12 * 1024 * 1024)))
 MAX_IMAGE_BYTES = int(os.environ.get("MAX_IMAGE_BYTES", str(5 * 1024 * 1024)))
 ALLOWED_ORIGINS = [origin.strip() for origin in os.environ.get("CORS_ALLOWED_ORIGINS", "").split(",") if origin.strip()]
+CURRENCY_CONFIDENCE_THRESHOLD = 0.94
+CURRENCY_MARGIN_THRESHOLD = 0.55
+CURRENCY_MIN_AGREEING_CROPS = 1
 
 SECRET_PATTERNS = [
     re.compile(r"sk-or-v1-[A-Za-z0-9_-]+"),
@@ -87,6 +100,9 @@ def root_for_currency_model(model_path):
 CURRENCY_MODEL = first_existing_path(currency_model_candidates())
 CURRENCY_ROOT = root_for_currency_model(CURRENCY_MODEL)
 CURRENCY_PYTHON = CURRENCY_ROOT / ".venv" / "bin" / "python"
+CURRENCY_YOLO_MODEL = None
+CURRENCY_MODEL_LOAD_ERROR = ""
+CURRENCY_MODEL_LOCK = threading.Lock()
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 GEMINI_TTS_MODEL = os.environ.get("GEMINI_TTS_MODEL", "gemini-2.5-flash-preview-tts").strip()
@@ -126,6 +142,9 @@ class GeminiBackendHandler(BaseHTTPRequestHandler):
                 "geminiTtsConfigured": bool(GEMINI_API_KEY),
                 "currencyModelExists": bool(CURRENCY_MODEL and CURRENCY_MODEL.exists()),
                 "currencyModelPath": str(CURRENCY_MODEL) if CURRENCY_MODEL else "",
+                "currencyModelLoaded": bool(CURRENCY_YOLO_MODEL),
+                "currencyModelLoadError": CURRENCY_MODEL_LOAD_ERROR,
+                "currencyRuntime": "in_process_yolo",
                 "voiceOptions": list(VOICE_OPTIONS.keys()),
             }
         )
@@ -188,10 +207,18 @@ class GeminiBackendHandler(BaseHTTPRequestHandler):
             if len(image_bytes) > MAX_IMAGE_BYTES:
                 self.send_json_error(413, "Image payload is too large", "image_too_large")
                 return
-            with tempfile.NamedTemporaryFile(suffix=".jpg") as image_file:
-                image_file.write(image_bytes)
-                image_file.flush()
-                result = classify_currency(image_file.name)
+            if not Image:
+                self.send_json_error(500, "Currency runtime is not available", "currency_runtime_missing")
+                return
+            image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+            result = classify_currency(image)
+            print(
+                "currency_result requestId=%s %s"
+                % (
+                    self.request_id,
+                    redact_sensitive_text(json.dumps(currency_log_summary(result))),
+                )
+            )
 
             self.send_json(result)
         except Exception as exc:
@@ -327,56 +354,62 @@ def pcm_to_wav(pcm_bytes, sample_rate=24000, channels=1, bits_per_sample=16):
     return header + pcm_bytes
 
 
-def classify_currency(image_path):
+def load_currency_model():
+    global CURRENCY_YOLO_MODEL
+    global CURRENCY_MODEL_LOAD_ERROR
+
+    if CURRENCY_YOLO_MODEL:
+        return True
+    if CURRENCY_IMPORT_ERROR:
+        CURRENCY_MODEL_LOAD_ERROR = f"currency_runtime_import_failed: {CURRENCY_IMPORT_ERROR}"
+        return False
     if not CURRENCY_MODEL or not CURRENCY_MODEL.exists():
         searched = [str(path) for path in currency_model_candidates() if path]
-        return {
-            "accepted": False,
-            "error": "Missing currency model",
-            "searched": searched,
-        }
+        CURRENCY_MODEL_LOAD_ERROR = "missing_currency_model; searched=" + "; ".join(searched)
+        return False
 
-    python_bin = CURRENCY_PYTHON if CURRENCY_PYTHON.exists() else "python3"
-    script = r"""
-import json
-import sys
+    try:
+        CURRENCY_YOLO_MODEL = YOLO(str(CURRENCY_MODEL))
+        CURRENCY_MODEL_LOAD_ERROR = ""
+        return True
+    except Exception as exc:
+        CURRENCY_YOLO_MODEL = None
+        CURRENCY_MODEL_LOAD_ERROR = f"currency_model_load_failed: {redact_sensitive_text(exc)}"
+        return False
 
-from PIL import Image
-from ultralytics import YOLO
 
-model_path = sys.argv[1]
-image_path = sys.argv[2]
-model = YOLO(model_path)
-image = Image.open(image_path).convert("RGB")
-w, h = image.size
+def currency_crop_boxes(width, height):
+    def box(name, left, top, right, bottom):
+        left = max(0, int(left))
+        top = max(0, int(top))
+        right = min(width, int(right))
+        bottom = min(height, int(bottom))
+        return name, (left, top, right, bottom)
 
-crop_boxes = [
-    ("full", (0, 0, w, h)),
-    ("center", (int(w * 0.08), int(h * 0.25), int(w * 0.92), int(h * 0.92))),
-    ("bottom_center", (int(w * 0.12), int(h * 0.48), int(w * 0.88), h)),
-    ("bottom_half", (0, int(h * 0.50), w, h)),
-    ("bottom_40", (0, int(h * 0.60), w, h)),
-    ("note_band", (int(w * 0.03), int(h * 0.45), int(w * 0.97), int(h * 0.80))),
-    ("table_area", (0, int(h * 0.35), int(w * 0.75), int(h * 0.70))),
-    ("note_closeup", (int(w * 0.30), int(h * 0.42), int(w * 0.78), int(h * 0.68))),
-    ("lower_left", (0, int(h * 0.42), int(w * 0.68), h)),
-    ("lower_right", (int(w * 0.32), int(h * 0.42), w, h)),
-    ("middle_lower", (int(w * 0.05), int(h * 0.38), int(w * 0.95), int(h * 0.86))),
-]
+    return [
+        box("full", 0, 0, width, height),
+        box("center", width * 0.08, height * 0.25, width * 0.92, height * 0.92),
+        box("bottom_center", width * 0.12, height * 0.48, width * 0.88, height),
+        box("bottom_half", 0, height * 0.50, width, height),
+        box("bottom_40", 0, height * 0.60, width, height),
+        box("note_band", width * 0.03, height * 0.45, width * 0.97, height * 0.80),
+        box("table_area", 0, height * 0.35, width * 0.75, height * 0.70),
+        box("note_closeup", width * 0.30, height * 0.42, width * 0.78, height * 0.68),
+        box("lower_left", 0, height * 0.42, width * 0.68, height),
+        box("lower_right", width * 0.32, height * 0.42, width, height),
+        box("middle_lower", width * 0.05, height * 0.38, width * 0.95, height * 0.86),
+    ]
 
-results = []
-for crop_name, box in crop_boxes:
-    left, top, right, bottom = box
-    if right - left < 80 or bottom - top < 80:
-        continue
-    crop = image.crop((left, top, right, bottom))
-    prediction = model(crop, imgsz=224, verbose=False)[0]
+
+def prediction_from_yolo_result(prediction, crop_name):
     probs = prediction.probs
     names = prediction.names
     confidences = probs.data.detach().cpu().tolist()
     ranked = sorted(
-        [{"label": str(names[index]), "confidence": float(confidence)}
-         for index, confidence in enumerate(confidences)],
+        [
+            {"label": str(names[index]), "confidence": float(confidence)}
+            for index, confidence in enumerate(confidences)
+        ],
         key=lambda item: item["confidence"],
         reverse=True,
     )
@@ -385,63 +418,164 @@ for crop_name, box in crop_boxes:
     margin = top["confidence"] - second["confidence"]
     label = top["label"]
     is_amount = label.isdigit()
-    results.append({
+    amount = int(label) if is_amount else None
+    accepted = (
+        is_amount
+        and top["confidence"] >= CURRENCY_CONFIDENCE_THRESHOLD
+        and margin >= CURRENCY_MARGIN_THRESHOLD
+    )
+    if accepted:
+        reason = "accepted"
+    elif not is_amount:
+        reason = "top_label_is_not_amount"
+    elif top["confidence"] < CURRENCY_CONFIDENCE_THRESHOLD:
+        reason = "low_confidence"
+    elif margin < CURRENCY_MARGIN_THRESHOLD:
+        reason = "low_margin"
+    else:
+        reason = "rejected"
+
+    return {
+        "source": "backend_yolo",
         "crop": crop_name,
         "label": label,
-        "amount": int(label) if is_amount else None,
+        "amount": amount,
         "confidence": top["confidence"],
         "margin": margin,
-        "accepted": is_amount and top["confidence"] >= 0.94 and margin >= 0.55,
-    })
+        "accepted": accepted,
+        "reason": reason,
+        "topCandidates": ranked[:5],
+    }
 
-accepted = [item for item in results if item["accepted"]]
-if accepted:
+
+def pick_currency_prediction(results):
+    candidates = sorted(
+        results,
+        key=lambda item: (item.get("confidence", 0), item.get("margin", 0)),
+        reverse=True,
+    )[:8]
+    accepted = [item for item in results if item.get("accepted") and item.get("amount")]
+    if not accepted:
+        best = dict(candidates[0]) if candidates else {}
+        return {
+            **best,
+            "accepted": False,
+            "source": "backend_yolo",
+            "reason": best.get("reason") or "no_strong_currency_crop",
+            "candidates": candidates,
+        }
+
     groups = {}
     for item in accepted:
         groups.setdefault(item["amount"], []).append(item)
-    strong_amounts = list(groups.keys())
-    if len(strong_amounts) == 1:
-        best_group = groups[strong_amounts[0]]
-        if len(best_group) >= 2:
-            best = dict(sorted(best_group, key=lambda item: (item["margin"], item["confidence"]), reverse=True)[0])
-            best["consensusCount"] = len(best_group)
-            best["candidates"] = [dict(item) for item in sorted(results, key=lambda item: (item["confidence"], item["margin"]), reverse=True)[:8]]
-            print(json.dumps(best))
-            raise SystemExit
-    conflict = {
-        "amounts": sorted(str(amount) for amount in strong_amounts),
-    }
-else:
-    conflict = {}
 
-best = dict(sorted(results, key=lambda item: (item["confidence"], item["margin"]), reverse=True)[0]) if results else {}
-print(json.dumps({
-    **best,
-    "accepted": False,
-    "reason": "not_enough_currency_crop_agreement",
-    "conflict": conflict,
-    "candidates": [dict(item) for item in sorted(results, key=lambda item: (item["confidence"], item["margin"]), reverse=True)[:8]],
-}))
-    """
-    process = subprocess.run(
-        [str(python_bin), "-c", script, str(CURRENCY_MODEL), image_path],
-        check=False,
-        capture_output=True,
-        text=True,
-        cwd=str(CURRENCY_ROOT),
-        timeout=30,
+    ranked_groups = sorted(
+        [
+            {
+                "amount": amount,
+                "items": items,
+                "count": len(items),
+                "best": sorted(
+                    items,
+                    key=lambda item: (item["margin"], item["confidence"]),
+                    reverse=True,
+                )[0],
+            }
+            for amount, items in groups.items()
+        ],
+        key=lambda group: (
+            group["count"],
+            group["best"]["margin"],
+            group["best"]["confidence"],
+        ),
+        reverse=True,
     )
-    if process.returncode != 0:
-        return {"accepted": False, "error": "currency_model_failed"}
+    best_group = ranked_groups[0]
+    if best_group["count"] < CURRENCY_MIN_AGREEING_CROPS:
+        best = dict(best_group["best"])
+        return {
+            **best,
+            "accepted": False,
+            "reason": "not_enough_currency_crop_agreement",
+            "candidates": candidates,
+        }
 
-    return json.loads(process.stdout.strip().splitlines()[-1])
+    best = dict(best_group["best"])
+    return {
+        **best,
+        "accepted": True,
+        "reason": "accepted",
+        "consensusCount": best_group["count"],
+        "candidates": candidates,
+        "conflictAmounts": [group["amount"] for group in ranked_groups[1:]],
+    }
+
+
+def classify_currency(image):
+    if not load_currency_model():
+        return {
+            "accepted": False,
+            "source": "backend_yolo",
+            "error": "currency_model_not_loaded",
+            "reason": CURRENCY_MODEL_LOAD_ERROR or "currency_model_not_loaded",
+        }
+
+    width, height = image.size
+    results = []
+    for crop_name, crop_box in currency_crop_boxes(width, height):
+        left, top, right, bottom = crop_box
+        if right - left < 80 or bottom - top < 80:
+            continue
+        crop = image.crop((left, top, right, bottom))
+        with CURRENCY_MODEL_LOCK:
+            prediction = CURRENCY_YOLO_MODEL(crop, imgsz=224, verbose=False)[0]
+        results.append(prediction_from_yolo_result(prediction, crop_name))
+
+    if not results:
+        return {
+            "accepted": False,
+            "source": "backend_yolo",
+            "reason": "no_valid_currency_crops",
+            "candidates": [],
+        }
+
+    return pick_currency_prediction(results)
+
+
+def currency_log_summary(result):
+    return {
+        "accepted": result.get("accepted"),
+        "source": result.get("source"),
+        "label": result.get("label"),
+        "amount": result.get("amount"),
+        "confidence": result.get("confidence"),
+        "margin": result.get("margin"),
+        "crop": result.get("crop"),
+        "reason": result.get("reason") or result.get("error"),
+        "candidates": [
+            {
+                "crop": item.get("crop"),
+                "label": item.get("label"),
+                "amount": item.get("amount"),
+                "confidence": item.get("confidence"),
+                "margin": item.get("margin"),
+                "accepted": item.get("accepted"),
+                "reason": item.get("reason"),
+            }
+            for item in result.get("candidates", [])[:8]
+        ],
+    }
 
 
 def main():
+    load_currency_model()
     server = ThreadingHTTPServer(("0.0.0.0", 5055), GeminiBackendHandler)
     print("Gemini TTS and currency server running on http://0.0.0.0:5055")
     print("TTS configured:", bool(GEMINI_API_KEY))
     print("Currency model:", CURRENCY_MODEL or "not found")
+    print("Currency model loaded:", bool(CURRENCY_YOLO_MODEL))
+    if CURRENCY_MODEL_LOAD_ERROR:
+        print("Currency model load error:", redact_sensitive_text(CURRENCY_MODEL_LOAD_ERROR))
     server.serve_forever()
 
 
