@@ -5,6 +5,7 @@ dist/
 web-build/
 android/
 ios/
+apk/
 .git/
 .DS_Store
 npm-debug.*

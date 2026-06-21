@@ -1,7 +1,10 @@
+const allowEmbeddedApiKey = process.env.ALLOW_EMBEDDED_API_KEY === 'true';
 const openRouterApiKey =
-  process.env.OPENROUTER_API_KEY || process.env.EXPO_PUBLIC_OPENROUTER_API_KEY || '';
+  allowEmbeddedApiKey ? process.env.EXPO_PUBLIC_OPENROUTER_API_KEY || '' : '';
 const geminiBackendUrl =
   process.env.GEMINI_BACKEND_URL || process.env.EXPO_PUBLIC_GEMINI_BACKEND_URL || '';
+const enableGeminiTts =
+  process.env.ENABLE_GEMINI_TTS === 'true' || process.env.EXPO_PUBLIC_ENABLE_GEMINI_TTS === 'true';
 
 module.exports = {
   name: 'بصيرة',
@@ -60,6 +63,7 @@ module.exports = {
   extra: {
     openRouterApiKey,
     geminiBackendUrl,
+    enableGeminiTts,
     eas: {
       projectId: 'a2c11edb-6807-4855-9d99-0c3b1ded4c18',
     },

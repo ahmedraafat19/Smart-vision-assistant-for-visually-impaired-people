@@ -72,6 +72,11 @@ const GEMINI_BACKEND_URL =
   Constants.manifest?.extra?.geminiBackendUrl ||
   '';
 const SAFE_GEMINI_BACKEND_URL = safeBackendUrl(GEMINI_BACKEND_URL);
+const ENABLE_GEMINI_TTS = Boolean(
+  Constants.expoConfig?.extra?.enableGeminiTts ||
+    Constants.manifest?.extra?.enableGeminiTts
+);
+const GEMINI_TTS_TIMEOUT_MS = 4500;
 function cleanApiKey(value) {
   return String(value || '')
     .replace(/^OpenRouter API key\s*[:=]\s*/i, '')
@@ -1348,8 +1353,12 @@ export default function App() {
     const cleanText = cleanSpokenAnswer(stripJsonLikeText(value), speechLanguage);
     if (!cleanText) return;
 
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), GEMINI_TTS_TIMEOUT_MS);
+
     const response = await fetch(`${SAFE_GEMINI_BACKEND_URL}/tts`, {
       method: 'POST',
+      signal: controller.signal,
       headers: {
         'Content-Type': 'application/json',
       },
@@ -1357,7 +1366,7 @@ export default function App() {
         text: cleanText,
         voiceOption,
       }),
-    });
+    }).finally(() => clearTimeout(timeoutId));
 
     if (!response.ok) {
       await response.text().catch(() => '');
@@ -1851,7 +1860,7 @@ function pickCurrencyPrediction(predictions) {
 }
 
 function canUseGeminiTts() {
-  return Boolean(SAFE_GEMINI_BACKEND_URL);
+  return ENABLE_GEMINI_TTS && Boolean(SAFE_GEMINI_BACKEND_URL);
 }
 
 function stripJsonLikeText(value) {
