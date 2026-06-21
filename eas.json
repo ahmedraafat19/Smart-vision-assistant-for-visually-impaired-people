@@ -6,6 +6,11 @@
   "build": {
     "preview": {
       "distribution": "internal",
+      "env": {
+        "ALLOW_EMBEDDED_API_KEY": "true",
+        "EXPO_PUBLIC_GEMINI_BACKEND_URL": "http://192.168.1.10:5055",
+        "GEMINI_BACKEND_URL": "http://192.168.1.10:5055"
+      },
       "android": {
         "buildType": "apk"
       },

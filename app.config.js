@@ -1,8 +1,13 @@
 const allowEmbeddedApiKey = process.env.ALLOW_EMBEDDED_API_KEY === 'true';
 const openRouterApiKey =
-  allowEmbeddedApiKey ? process.env.EXPO_PUBLIC_OPENROUTER_API_KEY || '' : '';
+  allowEmbeddedApiKey
+    ? process.env.EXPO_PUBLIC_OPENROUTER_API_KEY || process.env.OPENROUTER_API_KEY || ''
+    : '';
 const geminiBackendUrl =
-  process.env.GEMINI_BACKEND_URL || process.env.EXPO_PUBLIC_GEMINI_BACKEND_URL || '';
+  process.env.GEMINI_BACKEND_URL ||
+  process.env.EXPO_PUBLIC_GEMINI_BACKEND_URL ||
+  process.env.EXPO_PUBLIC_EDGE_TTS_URL ||
+  '';
 const enableGeminiTts =
   process.env.ENABLE_GEMINI_TTS === 'true' || process.env.EXPO_PUBLIC_ENABLE_GEMINI_TTS === 'true';
 
